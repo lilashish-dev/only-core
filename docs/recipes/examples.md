@@ -2,6 +2,11 @@
 
 Practical patterns for using only-core in real applications.
 
+The snippets use `only-core` as a readable import alias. This repository's
+documented setup is to clone the repository; from code inside the clone, import
+from `../src/index.js` (or build and import from `../dist/index.js`). Adapt the
+relative path to wherever you keep the clone in your application.
+
 ---
 
 ## E-Commerce Checkout
@@ -50,6 +55,83 @@ const checkout = policy<CheckoutContext>('Checkout', {
     return { orderId, itemCount: ctx.items.length };
   });
 ```
+
+---
+
+## AI Generation: Atomic Credits and Quota
+
+Separate reads such as `creditsAvailable()` and `quotaAvailable()` are not safe
+for charging. Two requests can both read the last credit before either writes.
+`only-core` orders checks and gates the action; it does not lock a database row,
+make service calls transactional, or prevent double-spending by itself.
+
+Make the final entitlement decision and reservation one atomic operation in the
+system that owns the balance. The operation should check subscription/model
+eligibility and conditionally reserve both credit and quota in one transaction
+(or atomic datastore operation). Scope an idempotency key to the authenticated
+user so retries of the same request reuse its reservation rather than reserve
+twice.
+
+```typescript
+import { policy } from 'only-core';
+
+interface ImageContext {
+  userId: string;
+  requestId: string; // Server-issued or validated idempotency key
+  prompt: string;
+  model: string;
+}
+
+const generateImage = policy<ImageContext>('Generate image', {
+  timeoutMs: 60_000,
+  mode: 'sequential',
+})
+  .only('authenticated', isAuthenticated)
+  .only('entitlement-reserved', async (ctx, signal) => {
+    // This service must atomically check subscription, model access, credits,
+    // and quota, then reserve the required units under requestId.
+    const reservation = await generationLedger.reserveIfEligible({
+      userId: ctx.userId,
+      requestId: ctx.requestId,
+      model: ctx.model,
+      credits: 1,
+      signal,
+    });
+    return reservation.ok || reservation.reason;
+  })
+  // Do not add predicates after a reservation guard unless reservation cleanup
+  // is guaranteed on every later rejection. Predicates run after all guards.
+  .to(async (ctx, signal) => {
+    try {
+      const image = await generateAI({
+        prompt: ctx.prompt,
+        model: ctx.model,
+        reservationId: ctx.requestId,
+        signal,
+      });
+      if (signal.aborted) {
+        throw signal.reason ?? new Error('Image generation was cancelled');
+      }
+      await generationLedger.commit(ctx.userId, ctx.requestId);
+      return image;
+    } catch (error) {
+      // Release is idempotent. Keep a lease expiry as crash recovery if this
+      // process dies before it can release or commit the reservation.
+      await generationLedger.release(ctx.userId, ctx.requestId)
+        .catch(reportReservationCleanupFailure);
+      throw error;
+    }
+  });
+```
+
+If two distinct requests compete for one remaining credit, the ledger's atomic
+reservation lets one succeed and rejects the other. That guarantee belongs to
+the ledger/database transaction, not `only-core`. `only-core` ensures generation
+does not start after a failed guard and carries cancellation to adapters that
+honor the signal. Use a lease or reconciliation job for process crashes, and
+make commit/release idempotent. Keep local schema checks before calling
+`execute()` or include them in the reservation operation, because a failed
+predicate after a side-effecting guard would otherwise leave a reservation.
 
 ---
 

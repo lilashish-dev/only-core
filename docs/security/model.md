@@ -31,7 +31,7 @@ When multiple guards and predicates operate on the same context object, there's 
 |----------|-----------|-----------|
 | `reference` | None | Original object exposed directly |
 | `snapshot` | Top-level isolation | `ctx.user.name` still mutable if `user` is a shared reference |
-| `immutable` | Deep freeze | Does not clone/freeze `Map`, `Set`, `WeakMap`, `WeakSet`, `Date`, `RegExp`, typed arrays, or class instances (copied by reference). Circular references unsupported. |
+| `immutable` | Clones/freezes arrays and plain objects | Non-plain values such as `Map`, `Set`, `Date`, `RegExp`, typed arrays, and class instances remain shared and are not frozen. Circular references unsupported. |
 
 ### What We DON'T Claim
 
@@ -43,6 +43,8 @@ When multiple guards and predicates operate on the same context object, there's 
 > A guard must not mutate the context or depend on side effects produced by another guard.
 
 This is a documented contract, not an enforced constraint. only-core does not detect guard dependencies — it is the developer's responsibility to ensure parallel guards are truly independent.
+
+Parallel fail-fast signals active sibling guards and stops scheduling queued guards. It cannot forcibly stop external work that ignores its signal. Aggregate mode collects policy violations in registration order; operational errors such as thrown guard exceptions, timeouts, and cancellation remain execution errors.
 
 ## Timeout Safety
 
@@ -58,6 +60,12 @@ underlying operation MAY cancel (if it respects the signal)
 
 **What happens:** The policy stops waiting and rejects with `PolicyTimeoutError`.
 **What doesn't happen:** The underlying network request, database query, or external API call is not guaranteed to be cancelled. Only operations that explicitly check `AbortSignal` will terminate.
+
+The action is invoked at most once by one policy execution. This is not an exactly-once guarantee for external side effects: client retries and multiple processes require application-level idempotency and coordination.
+
+## Atomic Resources
+
+Separate guard reads followed by a later write are subject to races. For balances, credits, inventory, quotas, and one-time claims, the authoritative service must check and reserve atomically (for example, a transaction or conditional update). only-core can require that reservation guard to pass before calling the action; it does not supply the transaction or distributed lock. See the [AI generation credit/quota recipe](../recipes/examples.md#ai-generation-atomic-credits-and-quota).
 
 ## Error Information Leakage
 

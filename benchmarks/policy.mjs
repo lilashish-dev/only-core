@@ -22,7 +22,7 @@ async function measure(run) {
   }
   return {
     medianUs: percentile(samples, 0.5),
-    p95SampleUs: percentile(samples, 0.95),
+    maxSampleUs: Math.max(...samples),
     throughputPerSecond: 1_000_000 / percentile(samples, 0.5),
   };
 }

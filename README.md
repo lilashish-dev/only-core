@@ -1,323 +1,132 @@
 # only-core
 
-> A zero-dependency, TypeScript-first policy execution engine for enforcing preconditions before executing business actions.
+A zero-runtime-dependency, TypeScript-first policy execution engine for enforcing preconditions before business actions run.
 
-[![Tests](https://img.shields.io/badge/tests-58%20passing-brightgreen)]()
-[![Zero Dependencies](https://img.shields.io/badge/dependencies-0-blue)]()
-[![TypeScript](https://img.shields.io/badge/TypeScript-first-blue)]()
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)]()
+> **Guarantee:** a policy action runs only after every guard and predicate has passed. This guarantee applies within one execution. It does not make external checks and writes transactional, distributed, or idempotent.
 
-## The Central Guarantee
+## What It Is
 
-> **The action is never invoked unless every required enforcement stage has successfully completed.**
+`only-core` provides an ordered policy pipeline:
 
-```
-Context → Policy → Guards → Predicates → Action → Result
+```text
+context -> guards -> predicates -> protected action -> result
 ```
 
-## What only-core Is
+- **Guards (`.only()`)** perform potentially asynchronous checks against external systems.
+- **Predicates (`.where()`)** perform synchronous checks against local context or application state.
+- **Actions (`.to()`)** contain the business operation and run only after enforcement succeeds.
 
-**Policy enforcement and controlled execution.**
-
-It is **not** an authorization framework, validation library, workflow engine, or general-purpose rules engine.
-
-Its job is to ensure that preconditions are met before business actions execute — reliably, predictably, and without external dependencies.
+It is an enforcement and orchestration primitive, not an authentication provider, authorization framework, schema validator, workflow engine, database transaction manager, or distributed lock service.
 
 ## Installation
 
+The supported installation path is cloning this repository. There is no npm-registry installation documented or required.
+
 ```bash
-npm install only-core
+git clone https://github.com/lilashish-dev/only-core.git
+cd only-core
+npm install
+npm run build
+npm test
 ```
+
+Requires Node.js 18 or newer. `npm install` installs this repository's development dependencies; the library itself has no runtime dependencies. Work from the cloned repository and its examples, or use the clone as a local dependency from your application after building it.
 
 ## Quick Start
 
 ```typescript
-import { policy } from 'only-core';
+import { policy, PolicyViolationError } from './src/index.js';
 
-interface CheckoutContext {
-  userId: string;
-  items: string[];
-  amount: number;
-  subscription: 'active' | 'expired';
+interface PublishContext {
+  actorId: string;
+  documentId: string;
+  reviewerApproved: boolean;
 }
 
-// Define guards (external enforcement — potentially async)
-async function isAuthenticated(ctx: Readonly<CheckoutContext>, signal: AbortSignal): Promise<boolean> {
-  // Check authentication against your auth system
-  return ctx.userId !== '';
-}
-
-// Define the policy
-const checkout = policy<CheckoutContext>('Checkout', {
+const publishDocument = policy<PublishContext>('Publish document', {
   timeoutMs: 5000,
-  mode: 'sequential',
-  contextStrategy: 'snapshot',
 })
-  .only('authenticated', isAuthenticated)
-  .only('active-subscription', (ctx) => 
-    ctx.subscription === 'active' || 'Subscription is expired'
+  .only('workspace-editor', async (context, signal) => {
+    return await accessService.isEditor(context.actorId, { signal })
+      || 'Actor cannot edit this workspace';
+  })
+  .where('review-approved', (context) =>
+    context.reviewerApproved || 'Reviewer approval is required'
   )
-  .where('cart-not-empty', (ctx) => 
-    ctx.items.length > 0 || 'Cart is empty'
-  )
-  .where('valid-amount', (ctx) => 
-    ctx.amount > 0 || 'Amount must be positive'
-  )
-  .to(async (ctx) => {
-    // This ONLY runs if ALL guards and predicates pass
-    return { orderId: 'ord_123', total: ctx.amount };
-  });
+  .to(async (context, signal) =>
+    documentService.publish(context.documentId, { signal })
+  );
 
-// Execute the policy
 try {
-  const result = await checkout.execute({
-    userId: 'user_123',
-    items: ['item_a', 'item_b'],
-    amount: 99.99,
-    subscription: 'active',
+  const result = await publishDocument.execute({
+    actorId: 'editor-42',
+    documentId: 'doc-103',
+    reviewerApproved: true,
   });
-  
-  console.log(result.value);        // { orderId: 'ord_123', total: 99.99 }
-  console.log(result.executionId);  // exec_01abc...
-  console.log(result.duration);     // 42 (ms)
+  console.log(result.value, result.executionId, result.duration);
 } catch (error) {
-  // Structured error with machine-readable code
-  // error.code === 'POLICY_VIOLATION'
-  // error.violations === [{ ruleId, phase, reason }]
+  if (error instanceof PolicyViolationError) {
+    console.error(error.code, error.violations);
+  }
+  throw error;
 }
 ```
 
-## Core Concepts
+Import from `./src/index.js` when running TypeScript through a compatible tool. For compiled JavaScript, build first and import from `./dist/index.js`.
 
-### Guards (`.only()`) — External Enforcement
-
-Guards handle checks that may involve external state:
-
-- Authentication / Authorization
-- Subscription status
-- Database lookups
-- Feature entitlements
-- Rate-limit checks
-
-**Characteristics:** potentially async, timeout-aware, cancellation-aware, can throw.
+## Configuration and Execution
 
 ```typescript
-.only('authenticated', async (ctx, signal) => {
-  const user = await authService.verify(ctx.token, { signal });
-  return user !== null;
-})
-```
-
-### Predicates (`.where()`) — Local State Checks
-
-Predicates handle deterministic, synchronous conditions:
-
-- `amount > 0`
-- `items.length > 0`
-- `status === 'draft'`
-
-**Characteristics:** synchronous, deterministic, cheap, no external I/O.
-
-```typescript
-.where('positive-amount', (ctx) => ctx.amount > 0 || 'Amount must be positive')
-```
-
-### Actions (`.to()`) — Protected Execution
-
-The action is the business logic that only runs when all enforcement passes. Calling `.to()` **seals** the policy — no further structural modification is allowed.
-
-```typescript
-.to(async (ctx, signal) => {
-  return await processPayment(ctx, { signal });
-})
-```
-
-## Configuration
-
-```typescript
-policy<Context>('PolicyName', {
-  timeoutMs: 5000,                    // Global timeout (default: 30000ms)
-  mode: 'sequential' | 'parallel',   // Guard execution mode (default: 'sequential')
-  concurrency: 4,                     // Max active guards in parallel (default: Infinity)
-  failureStrategy: 'fail-fast' | 'aggregate',  // (default: 'fail-fast')
-  contextStrategy: 'reference' | 'snapshot' | 'immutable',  // (default: 'snapshot')
-  reentrancy: 'reject' | 'allow',    // (default: 'reject')
-})
-```
-
-### Context Strategies
-
-| Strategy | Behavior | Use Case |
-|----------|----------|----------|
-| `reference` | Pass original object | Performance-critical, trusted code |
-| `snapshot` | Shallow copy | **Default.** Lightweight contexts |
-| `immutable` | Deep-clone then deep freeze | Maximum protection (expensive). Note: Does not clone/freeze Map, Set, classes, etc. |
-
-### Execution Modes
-
-| Mode + Strategy | Behavior |
-|-----------------|----------|
-| `sequential` + `fail-fast` | Run guards in order, stop on first failure |
-| `sequential` + `aggregate` | Run all guards, collect all failures |
-| `parallel` + `fail-fast` | Run guards concurrently, fail on first |
-| `parallel` + `aggregate` | Run all guards concurrently, collect all |
-
-Parallel `fail-fast` aborts active sibling guards and does not start queued
-guards after the first failure. `concurrency` must be a positive integer or
-`Infinity`; `timeoutMs` must be non-negative or `Infinity` (`0` disables timeout).
-
-## Cancellation
-
-First-class cancellation using `AbortSignal`:
-
-```typescript
-const controller = new AbortController();
-
-// Cancel after 2 seconds
-setTimeout(() => controller.abort(), 2000);
-
-const result = await checkout.execute(context, {
-  signal: controller.signal,
+policy<Context>('Policy name', {
+  timeoutMs: 5000,                    // default 30000; 0 or Infinity disables
+  mode: 'parallel',                   // 'sequential' by default
+  concurrency: 4,                     // parallel guard limit; Infinity by default
+  failureStrategy: 'fail-fast',       // or 'aggregate'
+  contextStrategy: 'snapshot',        // reference, snapshot, immutable
+  reentrancy: 'reject',               // or allow
 });
 ```
 
-**Important distinction:**
-- **Timeout** = "The policy waited too long."
-- **Cancellation** = "The caller no longer wants this operation."
+- Parallel guards must be independent. `concurrency` is a positive integer or `Infinity`.
+- Parallel `fail-fast` aborts active sibling signals and does not start queued guards after a failure. Underlying work stops only if it honors `AbortSignal`.
+- `aggregate` gathers policy violations in registration order. Unexpected guard exceptions, timeouts, and cancellation remain execution errors, not ordinary policy violations.
+- `snapshot` shallow-copies the outer context; nested values are shared. `immutable` clones/freezes arrays and plain objects. Non-plain instances and built-ins such as `Map`, `Set`, `Date`, and typed arrays are not cloned/frozen; circular input is unsupported.
+- `.execute()` returns a successful result or throws a structured error. The public `PolicyOutcome` type does not change this runtime behavior.
+- `.use()`, `.compose()`, and `.extend()` reuse guards and predicates. They do not inherit source actions, telemetry listeners, or configuration.
 
-## Error Architecture
+See the [API reference](docs/api/reference.md) for the complete contract.
 
-All errors carry structured, machine-readable information:
+## Use Cases
 
-```
-OnlyCoreError
-├── PolicyViolationError    (code: POLICY_VIOLATION)
-├── PolicyTimeoutError      (code: POLICY_TIMEOUT)
-├── PolicyCancelledError    (code: POLICY_CANCELLED)
-├── PolicyConfigurationError (code: POLICY_CONFIGURATION)
-├── PolicyExecutionError    (code: POLICY_EXECUTION)
-└── PolicyReentrancyError   (code: POLICY_REENTRANT)
-```
+Good fits are operations with explicit preconditions and one protected action:
 
-Every error includes:
-- `code` — Stable machine-readable error code
-- `info` — `{ policy, phase, ruleId, executionId, ... }`
-- `cause` — Original error (when wrapping)
-- `timestamp`
+- Document publishing: editor access, review approval, complete content, resolved comments.
+- AI generation: identity and entitlement checks before a reservation/generation action. Credit and quota reservation must be atomic in the system that owns the balance; separate checks in guards can race.
+- API access: key validity, allowlists, and independent external eligibility checks.
+- Feature access: entitlement checks before exposing a capability.
+- Administrative changes: role, approval, and state-transition preconditions.
+- Job dispatch: tenant access, job eligibility, and idempotent dispatch.
 
-**Semantic distinction:**
-- Guard returns `false` → `PolicyViolationError` (policy rejection)
-- Guard throws `Error` → `PolicyExecutionError` (execution failure)
+An in-memory document workflow is available in [examples/document-publishing.ts](examples/document-publishing.ts), with integration tests in [test/integration/document-publishing.test.ts](test/integration/document-publishing.test.ts). It demonstrates policy behavior and local state mutation, not real identity/database integrations.
 
-## Observability
+## Where It Is Not Enough
 
-Zero-dependency event-based observability via `.tap()`:
+Do not rely on `only-core` alone for authentication, authorization policy design, input/schema validation, rate limiting, fraud detection, payment safety, distributed coordination, or atomic resource accounting. Implement those in trusted application services and infrastructure. Use database transactions, conditional updates, idempotency keys, leases, or distributed locks where the invariant requires them.
 
-```typescript
-checkout.tap((event) => {
-  // Connect to OpenTelemetry, Datadog, Prometheus, etc.
-  console.log(`${event.type} [${event.executionId}]`);
-});
-```
+For example, two AI requests can both observe one available credit if checks are separate. Put the final eligibility check and credit/quota reservation in one atomic ledger operation. `only-core` can gate generation on that reservation result, but it cannot prevent double-spending itself. See [AI generation and atomic credits](docs/recipes/examples.md#ai-generation-atomic-credits-and-quota).
 
-**Events:** `policy:start`, `rule:start`, `rule:success`, `rule:failure`, `rule:timeout`, `predicate:start`, `predicate:success`, `predicate:failure`, `action:start`, `action:success`, `action:failure`, `policy:success`, `policy:failure`, `policy:cancelled`
+## Security and Reliability
 
-**Invariant:** Listener errors never affect policy behavior.
+The library does not make untrusted input safe. Review [SECURITY.md](SECURITY.md) and the [security model](docs/security/model.md) before using it across trust boundaries. In particular, timeouts stop the policy waiting and abort signals; they do not forcibly stop non-cooperative external work. Keep errors and rule details out of untrusted client responses.
 
-## Policy Composition
+## Benchmarks and Tests
 
-Reuse enforcement rules across policies:
+Run the full suite with `npm test`, repeated-execution stress checks with `npm run test:stress`, and the diagnostic latency/memory benchmarks with `npm run benchmark` and `npm run benchmark:memory`. Method and observed results are in [BENCHMARKS.md](BENCHMARKS.md). Measurements are local Node.js microbenchmarks, not service-level guarantees.
 
-```typescript
-const authPolicy = policy<Context>('Auth')
-  .only('authenticated', isAuthenticated)
-  .to((ctx) => ctx);
+## Reporting Issues
 
-const billingPolicy = policy<Context>('Billing')
-  .only('active-subscription', hasSubscription)
-  .to((ctx) => ctx);
-
-const checkout = policy<Context>('Checkout')
-  .use(authPolicy)
-  .use(billingPolicy)
-  .where('cart-valid', (ctx) => ctx.items.length > 0)
-  .to(processCheckout);
-```
-
-Use `.compose(authPolicy, billingPolicy)` to append multiple policies at once,
-or `authPolicy.extend('Checkout')` to start a new builder with the source
-policy's guards and predicates. Composition reuses checks only: source actions,
-listeners, and configuration are not inherited.
-
-## Domain Example: Document Publishing
-
-See [examples/document-publishing.ts](examples/document-publishing.ts) for a publishing workflow guarded by workspace access, reviewer approval, complete content, and resolved comments. Its integration tests use in-memory adapters; they verify policy execution and state mutation, not a live identity provider or database.
-
-## Benchmarks and Memory Audit
-
-Run `npm run benchmark` to compare direct action calls with policies containing 0, 1, 5, or 10 passing guards, with telemetry on and off. Run `npm run benchmark:memory` for repeated success/rejection executions with forced garbage collection between samples. These are diagnostic measurements without pass/fail thresholds; use the same Node version and machine when comparing runs.
-
-## Introspection
-
-Read-only policy inspection for debugging, testing, and admin dashboards:
-
-```typescript
-const description = checkout.describe();
-// {
-//   name: 'Checkout',
-//   mode: 'sequential',
-//   guards: [{ id: 'authenticated', metadata: {...} }, ...],
-//   predicates: [{ id: 'cart-valid', metadata: {...} }],
-//   hasAction: true,
-//   composedPolicies: ['Auth', 'Billing'],
-// }
-```
-
-## Stable Rule IDs
-
-Always use explicit IDs for enterprise applications:
-
-```typescript
-// ✅ Recommended: explicit ID
-.only('authenticated', isAuthenticated)
-
-// ⚠️ Acceptable: uses function.name (fragile with minifiers)
-.only(isAuthenticated)
-```
-
-## Rule Metadata
-
-Attach metadata for richer telemetry:
-
-```typescript
-.only('fraud-check', checkFraud, {
-  description: 'Validates transaction against fraud detection',
-  tags: ['security', 'billing'],
-  severity: 'critical',
-  timeoutMs: 5000,  // Per-rule timeout
-})
-```
-
-## Supported Environments
-
-**Required capabilities:** ES2022+, `AbortController`, `Promise`, `WeakSet`, `Object.freeze`
-
-| Environment | Version |
-|-------------|---------|
-| Node.js | 18 LTS+ |
-| Chrome | 94+ |
-| Firefox | 93+ |
-| Safari | 15.4+ |
-| Edge | 94+ |
-
-## API Reference
-
-See [docs/api/](./docs/api/) for the complete API reference.
-
-## Security
-
-See [SECURITY.md](./SECURITY.md) for the security model and responsible disclosure.
+For bugs, questions, or security concerns, email **ikkegoon@gmail.com**. Include the Node.js version, reproduction steps, expected behavior, and actual behavior. Please avoid sending credentials, tokens, customer data, or other secrets.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
